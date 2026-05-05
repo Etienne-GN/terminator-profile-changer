@@ -328,9 +328,9 @@ class ProfileSwitcher(plugin.MenuItem):
     # ---------------------------------------------------------- scrollbar tint
 
     def _tint_scrollbar(self, terminal, profile):
-        """Recolor the terminal's scrollbar to match the profile's
-        background/foreground. Uses a per-terminal CSS class so we can target
-        the scrollbar from a screen-wide provider (per-widget providers are
+        """Color the terminal's scrollbar gutter to match the profile's
+        background. Uses a per-terminal CSS class so we can target the
+        scrollbar from a screen-wide provider (per-widget providers are
         often outranked by theme CSS in modern GTK).
         """
         scrollbar = getattr(terminal, 'scrollbar', None)
@@ -341,18 +341,20 @@ class ProfileSwitcher(plugin.MenuItem):
             cfg = Config()
             cfg.set_profile(profile)
             bg = cfg['background_color']
-            fg = cfg['foreground_color']
         except Exception as ex:
             err('ProfileSwitcher: cannot read colors for %r: %s'
                 % (profile, ex))
             return
-        if not bg or not fg:
-            err('ProfileSwitcher: tint skipped, missing colors '
-                '(bg=%r fg=%r)' % (bg, fg))
+        if not bg:
+            err('ProfileSwitcher: tint skipped, missing background_color')
             return
-        dbg('ProfileSwitcher: tinting scrollbar profile=%s bg=%s fg=%s'
-            % (profile, bg, fg))
+        dbg('ProfileSwitcher: tinting scrollbar profile=%s bg=%s'
+            % (profile, bg))
 
+        # Only color the scrollbar gutter (trough/contents). The slider is
+        # an internal CSS node painted differently by every theme, so any
+        # attempt to override it is fragile across themes -- leave it to
+        # the theme. The trough color alone is a strong enough cue.
         css_class = 'profile-switcher-sb-%d' % id(terminal)
         ctx = scrollbar.get_style_context()
         if not ctx.has_class(css_class):
@@ -367,16 +369,7 @@ class ProfileSwitcher(plugin.MenuItem):
             ' border-color: {bg};'
             ' box-shadow: none;'
             ' }}\n'
-            'scrollbar.{cls} slider,'
-            'scrollbar.{cls} slider:hover,'
-            'scrollbar.{cls} slider:active,'
-            'scrollbar.{cls} slider:backdrop,'
-            'scrollbar.{cls} slider:disabled {{'
-            ' background-color: {fg};'
-            ' background-image: none;'
-            ' background-clip: border-box;'
-            ' }}\n'
-        ).format(cls=css_class, bg=bg, fg=fg)
+        ).format(cls=css_class, bg=bg)
 
         provider = self.css_providers.get(terminal)
         if provider is None:
