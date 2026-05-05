@@ -167,7 +167,8 @@ class ProfileSwitcher(plugin.MenuItem):
     def _ensure_state(self, terminal):
         if terminal not in self.state:
             self.state[terminal] = {'last_applied': None,
-                                    'last_signature': None}
+                                    'last_signature': None,
+                                    'last_tinted_profile': None}
         return self.state[terminal]
 
     def _update_watched(self):
@@ -268,11 +269,19 @@ class ProfileSwitcher(plugin.MenuItem):
         state = self._ensure_state(terminal)
         cmd, args = self._foreground(terminal)
         signature = (cmd, args)
-        if signature == state['last_signature']:
-            return True
-        state['last_signature'] = signature
-        target = self._match(cmd, args) if cmd else None
-        self._apply(terminal, target)
+        if signature != state['last_signature']:
+            state['last_signature'] = signature
+            target = self._match(cmd, args) if cmd else None
+            self._apply(terminal, target)
+        # Catch manual profile switches (right-click -> Profiles -> ...)
+        # that don't go through our _set_profile path: if the terminal's
+        # current profile differs from what we last tinted, re-tint.
+        try:
+            current = terminal.get_profile()
+        except Exception:
+            current = None
+        if current and current != state['last_tinted_profile']:
+            self._tint_scrollbar(terminal, current)
         return True
 
     # ---------------------------------------------------------- profile switch
@@ -388,6 +397,7 @@ class ProfileSwitcher(plugin.MenuItem):
         except Exception as ex:
             err('ProfileSwitcher: scrollbar css load failed: %s' % ex)
             return
+        self._ensure_state(terminal)['last_tinted_profile'] = profile
         # GTK doesn't always re-resolve style when a class is added on an
         # already-realized widget. Force it.
         try:
