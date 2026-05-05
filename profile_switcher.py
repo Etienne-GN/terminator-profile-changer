@@ -28,7 +28,7 @@
 import os
 import fnmatch
 
-from gi.repository import Gtk, GObject, GLib
+from gi.repository import Gtk, Gdk, GObject, GLib
 
 import terminatorlib.plugin as plugin
 from terminatorlib.config import Config
@@ -40,6 +40,7 @@ AVAILABLE = ['ProfileSwitcher']
 
 DEFAULT_PROFILE = 'default'
 COMMAND_POLL_MS = 1000
+WATCH_SCAN_MS = 500
 
 (COL_COMMAND, COL_ARGUMENT, COL_PROFILE) = (0, 1, 2)
 
@@ -54,6 +55,8 @@ class ProfileSwitcher(plugin.MenuItem):
                               #              'last_signature': (cmd, args)|None}
     handler_ids = None        # terminal -> [(obj, hid), ...] for cleanup
     timer_ids = None          # terminal -> GLib source id for command polling
+    css_providers = None      # terminal -> Gtk.CssProvider for scrollbar tint
+    scan_timer_id = None      # GLib source id for the global new-terminal scan
 
     def __init__(self):
         plugin.MenuItem.__init__(self)
@@ -62,8 +65,15 @@ class ProfileSwitcher(plugin.MenuItem):
         self.state = {}
         self.handler_ids = {}
         self.timer_ids = {}
+        self.css_providers = {}
         self._load_config()
         self._update_watched()
+        # Catch terminals that may not yet exist when __init__ runs:
+        # idle_add fires as soon as the main loop is ready, then the
+        # periodic timer keeps watching for new tabs/splits.
+        GLib.idle_add(self._initial_scan_idle)
+        self.scan_timer_id = GLib.timeout_add(WATCH_SCAN_MS,
+                                              self._scan_for_new_terminals)
 
     def unload(self):
         for _terminal, entries in list(self.handler_ids.items()):
@@ -77,8 +87,29 @@ class ProfileSwitcher(plugin.MenuItem):
                 GLib.source_remove(tid)
             except Exception:
                 pass
+        if self.scan_timer_id is not None:
+            try:
+                GLib.source_remove(self.scan_timer_id)
+            except Exception:
+                pass
+            self.scan_timer_id = None
+        for terminal, provider in list(self.css_providers.items()):
+            sb = getattr(terminal, 'scrollbar', None)
+            screen = None
+            if sb is not None:
+                try:
+                    screen = sb.get_screen()
+                except Exception:
+                    screen = None
+            if screen is None:
+                screen = Gdk.Screen.get_default()
+            try:
+                Gtk.StyleContext.remove_provider_for_screen(screen, provider)
+            except Exception:
+                pass
         self.handler_ids.clear()
         self.timer_ids.clear()
+        self.css_providers.clear()
         self.watched.clear()
         self.state.clear()
 
@@ -144,6 +175,12 @@ class ProfileSwitcher(plugin.MenuItem):
         for terminal in Terminator().terminals:
             if terminal in self.watched:
                 continue
+            # The plugin can be instantiated *during* the terminal's
+            # __init__ (terminator/terminal.py calls load_plugins() before
+            # creating the terminalbox/scrollbar). Skip until the scrollbar
+            # exists; the periodic scan will retry.
+            if getattr(terminal, 'scrollbar', None) is None:
+                continue
             try:
                 hid_focus = terminal.connect('focus-out',
                                              self._on_focus_out_delayed, None)
@@ -155,6 +192,11 @@ class ProfileSwitcher(plugin.MenuItem):
                 self._ensure_state(terminal)
                 self.watched.add(terminal)
                 dbg('ProfileSwitcher: watching %s' % terminal)
+                try:
+                    current = terminal.get_profile() or DEFAULT_PROFILE
+                    self._tint_scrollbar(terminal, current)
+                except Exception as ex:
+                    err('ProfileSwitcher: initial tint failed: %s' % ex)
             except Exception as ex:
                 err('ProfileSwitcher: failed to wire terminal: %s' % ex)
 
@@ -165,6 +207,24 @@ class ProfileSwitcher(plugin.MenuItem):
     def _update_watched_idle(self):
         self._update_watched()
         return False
+
+    def _scan_for_new_terminals(self):
+        """Periodic scan to catch terminals spawned without a focus event
+        (initial window, new tabs/splits). Cheap: just iterates the list."""
+        try:
+            self._update_watched()
+        except Exception as ex:
+            err('ProfileSwitcher: scan failed: %s' % ex)
+        return True
+
+    def _initial_scan_idle(self):
+        """Run once as soon as the GTK main loop is idle, so terminals that
+        weren't yet created when __init__ ran get tinted immediately."""
+        try:
+            self._update_watched()
+        except Exception as ex:
+            err('ProfileSwitcher: initial scan failed: %s' % ex)
+        return False  # one-shot
 
     # ----------------------------------------------------- foreground command
 
@@ -254,14 +314,98 @@ class ProfileSwitcher(plugin.MenuItem):
                 % (profile, DEFAULT_PROFILE))
             profile = DEFAULT_PROFILE
         if terminal.get_profile() == profile:
+            self._tint_scrollbar(terminal, profile)
             return True
         dbg('ProfileSwitcher: switching terminal to %s' % profile)
         try:
             terminal.force_set_profile(None, profile)
-            return True
         except Exception as ex:
             err('ProfileSwitcher: force_set_profile failed: %s' % ex)
             return False
+        self._tint_scrollbar(terminal, profile)
+        return True
+
+    # ---------------------------------------------------------- scrollbar tint
+
+    def _tint_scrollbar(self, terminal, profile):
+        """Recolor the terminal's scrollbar to match the profile's
+        background/foreground. Uses a per-terminal CSS class so we can target
+        the scrollbar from a screen-wide provider (per-widget providers are
+        often outranked by theme CSS in modern GTK).
+        """
+        scrollbar = getattr(terminal, 'scrollbar', None)
+        if scrollbar is None:
+            err('ProfileSwitcher: tint skipped, no scrollbar on terminal')
+            return
+        try:
+            cfg = Config()
+            cfg.set_profile(profile)
+            bg = cfg['background_color']
+            fg = cfg['foreground_color']
+        except Exception as ex:
+            err('ProfileSwitcher: cannot read colors for %r: %s'
+                % (profile, ex))
+            return
+        if not bg or not fg:
+            err('ProfileSwitcher: tint skipped, missing colors '
+                '(bg=%r fg=%r)' % (bg, fg))
+            return
+        dbg('ProfileSwitcher: tinting scrollbar profile=%s bg=%s fg=%s'
+            % (profile, bg, fg))
+
+        css_class = 'profile-switcher-sb-%d' % id(terminal)
+        ctx = scrollbar.get_style_context()
+        if not ctx.has_class(css_class):
+            ctx.add_class(css_class)
+
+        css = (
+            'scrollbar.{cls},'
+            'scrollbar.{cls} trough,'
+            'scrollbar.{cls} contents {{'
+            ' background-color: {bg};'
+            ' background-image: none;'
+            ' border-color: {bg};'
+            ' box-shadow: none;'
+            ' }}\n'
+            'scrollbar.{cls} slider,'
+            'scrollbar.{cls} slider:hover,'
+            'scrollbar.{cls} slider:active,'
+            'scrollbar.{cls} slider:backdrop,'
+            'scrollbar.{cls} slider:disabled {{'
+            ' background-color: {fg};'
+            ' background-image: none;'
+            ' background-clip: border-box;'
+            ' }}\n'
+        ).format(cls=css_class, bg=bg, fg=fg)
+
+        provider = self.css_providers.get(terminal)
+        if provider is None:
+            provider = Gtk.CssProvider()
+            try:
+                screen = scrollbar.get_screen() or Gdk.Screen.get_default()
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            except Exception as ex:
+                err('ProfileSwitcher: add_provider_for_screen failed: %s'
+                    % ex)
+                return
+            self.css_providers[terminal] = provider
+        try:
+            provider.load_from_data(css.encode('utf-8'))
+        except Exception as ex:
+            err('ProfileSwitcher: scrollbar css load failed: %s' % ex)
+            return
+        # GTK doesn't always re-resolve style when a class is added on an
+        # already-realized widget. Force it.
+        try:
+            scrollbar.reset_style()
+        except Exception:
+            pass
+        try:
+            scrollbar.queue_resize()
+            scrollbar.queue_draw()
+        except Exception:
+            pass
 
     # ----------------------------------------------------------- context menu
 
