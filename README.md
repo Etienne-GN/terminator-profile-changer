@@ -17,6 +17,8 @@ Define rules like:
 
 When you run `ssh user@prod-db`, Terminator switches that pane to your `red` profile. When you exit back to the shell, it reverts to `default`. Profiles you set manually are never clobbered.
 
+The plugin also recolors the **scrollbar gutter** to match each profile's `background_color`, so the colored cue extends to the side of the pane. This applies on startup, on rule-driven switches, and on manual profile changes (right-click → Profiles → ...). Only the gutter is recolored; the slider keeps the GTK theme's styling because that part is theme-fragile to override.
+
 ## Requirements
 
 - Terminator
